@@ -19,21 +19,16 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Build
         run: cargo build --release
-      - name: Stage artifact
+      - name: Stage executable
         shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Path out | Out-Null
-          Copy-Item target\release\selflock.exe out\selflock.exe
-          Copy-Item README.md out\README.md
-          Copy-Item COPYING out\COPYING
-          Compress-Archive -Path out\* -DestinationPath selflock-windows.zip
+        run: Copy-Item target\release\selflock.exe SelfLock.exe
       - uses: actions/upload-artifact@v4
         with:
-          name: selflock-windows
-          path: selflock-windows.zip
+          name: SelfLock
+          path: SelfLock.exe
       - name: Publish GitHub release
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: selflock-windows.zip
+          files: SelfLock.exe
           generate_release_notes: true

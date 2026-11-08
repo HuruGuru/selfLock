@@ -6,7 +6,7 @@ Cargo.lock.bak
 # Local release artifacts / generated files
 /dist
 /out
-/selflock-windows.zip
+/SelfLock.exe
 /sbom.cdx.json
 *.exe
 *.dll
