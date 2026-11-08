@@ -51,10 +51,9 @@ fn link_regex() -> &'static Regex {
 fn host_from_url(url: &str) -> Option<(String, String)> {
     let (scheme, rest) = if let Some(rest) = url.strip_prefix("//") {
         ("http".to_string(), rest.to_string())
-    } else if let Some(idx) = url.find("://") {
-        (url[..idx].to_lowercase(), url[idx + 3..].to_string())
     } else {
-        return None; // relative link, same host
+        let idx = url.find("://")?; // relative link, same host
+        (url[..idx].to_lowercase(), url[idx + 3..].to_string())
     };
     if scheme != "http" && scheme != "https" {
         return None;
