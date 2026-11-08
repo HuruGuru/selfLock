@@ -1,18 +1,16 @@
-# SelfLock
-
-<p align="center">
-    <img src="./assets/lock.png" />
-</p>
-
 ## About
 
-SelfLock is a free and open-source application for Windows that lets you block **your own** access to distracting websites, your mail servers, or anything else on the Internet. Just set a period of time to block for, add sites or applications to your blocklist, and click "Start Block". Until that timer expires, you will be unable to access those sites — even if you restart your computer or close the application.
+selfLock is a free and open-source application for Windows that lets you block **your own** access to distracting websites, your mail servers, or anything else on the Internet. Just set a period of time to block for, add sites or applications to your blocklist, and click "Start Block". Until that timer expires, you will be unable to access those sites — even if you restart your computer or close the application.
 
 Tick **Application blocking** to also block selected programs (for example `firefox.exe`) with Windows Firewall rules. While a block is active, those applications can be started but cannot reach the network.
 
 ## Credits
 
 Originally developed for macOS by [Charlie Stigler](http://charliestigler.com), [Steve Lambert](http://visitsteve.com), and [others](https://github.com/SelfControlApp/selfcontrol/graphs/contributors). This is a Windows port written in Rust, based on the original project's blocking model and file formats.
+
+## Contributors
+
+See [CONTRIBUTORS.md](./CONTRIBUTORS.md).
 
 ## License
 
