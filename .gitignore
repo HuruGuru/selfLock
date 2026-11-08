@@ -1,0 +1,20 @@
+# Rust build output
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Local release artifacts / generated files
+/dist
+/out
+/selflock-windows.zip
+/sbom.cdx.json
+*.exe
+*.dll
+*.pdb
+
+# Editor / OS cruft
+.vscode/
+.idea/
+.vs/
+*.log
+Thumbs.db

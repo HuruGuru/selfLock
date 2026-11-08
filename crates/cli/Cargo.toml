@@ -1,0 +1,18 @@
+[package]
+name = "selflock-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Command-line interface for the SelfLock Windows port"
+default-run = "selflock-cli"
+
+[[bin]]
+name = "selflock-cli"
+path = "src/main.rs"
+
+[dependencies]
+selflock-core = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+chrono = { version = "0.4", features = ["serde"] }
+serde_json = "1"
+log = "0.4"

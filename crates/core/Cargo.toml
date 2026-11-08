@@ -1,0 +1,28 @@
+[package]
+name = "selflock-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Core blocking engine for the SelfLock Windows port"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+plist = "1"
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+dns-lookup = "2"
+thiserror = "2"
+log = { version = "0.4", features = ["std"] }
+ureq = { version = "2", default-features = false, features = ["tls"] }
+
+[dependencies.windows-sys]
+version = "0.59"
+features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+]

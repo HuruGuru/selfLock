@@ -1,0 +1,4 @@
+# Lints beyond the default set are opted into via CI (see .github/workflows/ci.yml).
+# These thresholds tune the pedantic-style lints.
+too-many-arguments-threshold = 8
+type-complexity-threshold = 300

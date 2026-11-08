@@ -1,0 +1,23 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/cli",
+    "crates/gui",
+]
+
+[workspace.package]
+version = "1.4.0"
+edition = "2021"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/HuruGuru/selfLock"
+description = "SelfLock — a Windows website and application block timer"
+
+[workspace.dependencies]
+selflock-core = { path = "crates/core", version = "1.4.0" }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = true
+opt-level = 3

@@ -1,0 +1,45 @@
+[advisories]
+# The advisory database format. `version = 2` matches current cargo-deny.
+version = 2
+yanked = "deny"
+# `ttf-parser` is unmaintained (RUSTSEC-2026-0192). It is an unavoidable transitive
+# dependency of egui 0.29 (`egui -> epaint -> ab_glyph -> owned_ttf_parser ->
+# ttf-parser`) with no fixed release available; it is only used to parse the bundled
+# UI fonts, not attacker-controlled input.
+ignore = [
+    "RUSTSEC-2026-0192", # unmaintained ttf-parser (via egui/epaint)
+]
+
+[licenses]
+version = 2
+confidence-threshold = 0.9
+allow = [
+    "GPL-3.0-or-later",
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0",
+    "OFL-1.1",
+    # Non-SPDX (Ubuntu Font License) used by the fonts bundled with egui/epaint.
+    "LicenseRef-UFL-1.0",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Allow the same crate at different majors when they only exist as duplicated
+# transitive deps (windows-sys, thiserror, …); flagged as warnings above instead.
+highlight = "all"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
