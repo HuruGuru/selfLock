@@ -588,6 +588,30 @@ mod tests {
     }
 
     #[test]
+    fn resolves_explicit_unicode_path() {
+        let dir = std::env::temp_dir().join(format!(
+            "SelfLock-кириллица-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join("приложение.exe");
+        std::fs::write(&exe, b"MZ").unwrap();
+
+        let resolved = resolve(exe.to_str().unwrap());
+        assert_eq!(resolved, vec![exe.clone()]);
+
+        let normalized = normalize_spec(exe.to_str().unwrap());
+        assert_eq!(normalized.as_deref(), exe.to_str());
+
+        let _ = std::fs::remove_file(&exe);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn resolves_firefox_when_installed() {
         let known = std::path::Path::new(r"C:\Program Files\Mozilla Firefox\firefox.exe");
         if !known.is_file() {

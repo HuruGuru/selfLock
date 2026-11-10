@@ -12,7 +12,7 @@ use selflock_core::manager::BlockManager;
 use selflock_core::scheduler;
 use selflock_core::security;
 use selflock_core::settings::Settings;
-use selflock_core::{logging, paths, VERSION};
+use selflock_core::{logging, paths, Error, VERSION};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -232,13 +232,16 @@ fn cmd_start(args: StartArgs, log_path: &std::path::Path) -> u8 {
     }
 
     // Determine blocklist / end date / allowlist.
-    let (mut blocklist, mut is_allowlist, end_date) = match resolve_block_source(&args, &settings) {
+    let (mut blocklist, is_allowlist, end_date) = match resolve_block_source(&args, &settings) {
         Ok(v) => v,
         Err(code) => return code,
     };
-    // Allowlist blocks are a development-only feature.
-    if !cfg!(debug_assertions) {
-        is_allowlist = false;
+    // Allowlist blocks are a development-only feature. Refuse them loudly instead
+    // of silently turning "allow only X" into "block X".
+    if is_allowlist && !cfg!(debug_assertions) {
+        eprintln!("ERROR: allowlist blocks are not supported in release builds.");
+        log::error!("start: allowlist requested in a release build");
+        return EX_CONFIG;
     }
 
     // `--app` entries are additive and use the same `app:` syntax as the GUI and
@@ -269,6 +272,9 @@ fn cmd_start(args: StartArgs, log_path: &std::path::Path) -> u8 {
         Ok(v) => v,
         Err(code) => return code,
     };
+    // Snapshot before applying this invocation's overrides, so the update below can
+    // tell our changes apart from a concurrent process's changes.
+    let baseline = settings.clone();
     if let Some(json) = &settings_json {
         if let Err(e) = apply_settings_json(&mut settings, json) {
             eprintln!("ERROR: Failed to parse JSON settings: {e}");
@@ -310,7 +316,28 @@ fn cmd_start(args: StartArgs, log_path: &std::path::Path) -> u8 {
     // the usual cause of an otherwise mysterious start failure.
     log::info!("start: blocklist = {blocklist:?}");
 
-    settings.begin_block(blocklist.clone(), is_allowlist, end_date);
+    // Persist the block state *before* touching the system. If the process dies
+    // during the firewall/hosts work, the block is still tracked and can be
+    // removed (fail closed), rather than leaving untracked rules behind.
+    //
+    // The check-and-set happens under the settings lock so two concurrent starts
+    // cannot both believe the machine is idle.
+    let mut desired = settings.clone();
+    desired.begin_block(blocklist.clone(), is_allowlist, end_date);
+    settings = match Settings::update(|current| {
+        if current.block_is_running {
+            return Err(Error::other("block is already running"));
+        }
+        current.merge_block_start(&baseline, &desired);
+        Ok(())
+    }) {
+        Ok(updated) => updated,
+        Err(e) => {
+            eprintln!("ERROR: could not persist settings: {e}");
+            log::error!("could not persist settings before start: {e}");
+            return EX_SOFTWARE;
+        }
+    };
 
     let mut manager = BlockManager::new(
         is_allowlist,
@@ -322,6 +349,16 @@ fn cmd_start(args: StartArgs, log_path: &std::path::Path) -> u8 {
     println!("Adding firewall rules...");
     if let Err(e) = manager.start_block_from_strings(&blocklist) {
         log::error!("failed to start block: {e}");
+        if manager.block_is_active() {
+            // Rollback was incomplete: keep the persisted state so the GUI and the
+            // scheduled task can still clear the partial block.
+            log::error!("start failed but rules are still active; keeping block state");
+        } else {
+            settings.remove_block_from_settings();
+            if let Err(save_err) = settings.save() {
+                log::error!("could not roll back settings after failed start: {save_err}");
+            }
+        }
         if e.is_permission_denied() {
             eprintln!("ERROR: Permission denied. Re-run with administrator privileges.");
         } else {
@@ -329,12 +366,6 @@ fn cmd_start(args: StartArgs, log_path: &std::path::Path) -> u8 {
         }
         eprintln!("See log for details: {}", log_path.display());
         return EX_SOFTWARE;
-    }
-
-    settings.block_is_running = true;
-    if let Err(e) = settings.save() {
-        eprintln!("WARNING: could not persist settings: {e}");
-        log::warn!("could not persist settings: {e}");
     }
 
     // Browser/DNS cache clearing is intentionally NOT done here: this runs as a
@@ -386,7 +417,7 @@ fn cmd_add(args: AddArgs, log_path: &std::path::Path) -> u8 {
         return EX_UNAVAILABLE;
     }
 
-    let mut settings = match Settings::load() {
+    let settings = match Settings::load() {
         Ok(s) => s,
         Err(e) => return fail("could not load settings", e),
     };
@@ -458,8 +489,17 @@ fn cmd_add(args: AddArgs, log_path: &std::path::Path) -> u8 {
         }
     };
 
-    settings.active_blocklist.extend(new.iter().cloned());
-    if let Err(e) = settings.save() {
+    // Re-read under the settings lock and append, so a concurrent add/clear cannot
+    // be overwritten by this process's older snapshot.
+    if let Err(e) = Settings::update(|current| {
+        if !current.block_is_running {
+            return Err(Error::other(
+                "block is no longer running; not persisting the added entries",
+            ));
+        }
+        current.active_blocklist.extend(new.iter().cloned());
+        Ok(())
+    }) {
         eprintln!("WARNING: entries were applied but could not be persisted: {e}");
         log::warn!("add: could not persist settings: {e}");
     }
@@ -605,40 +645,75 @@ fn cmd_remove(args: RemoveArgs, _log_path: &std::path::Path) -> u8 {
         return EX_UNAVAILABLE;
     }
 
-    let mut settings = match Settings::load() {
-        Ok(s) => s,
-        Err(e) => return fail("could not load settings", e),
-    };
-
-    // The scheduled auto-clear fires on a repeating timer, at logon, and possibly
-    // again after a resume. Only an actually expired block may be lifted.
-    match removal_decision(&settings, args.if_expired) {
-        RemovalDecision::Clear => {}
-        RemovalDecision::NotExpired => {
-            log::info!(
-                "remove: --if-expired, block still runs until {:?}; nothing to do",
-                settings.block_end_date
+    // Clearing must not depend on a readable settings file: a corrupt or missing
+    // file is exactly when the user most needs a way out. Keep the error only for
+    // logging and carry on with defaults.
+    let (mut settings, settings_unreadable) = match Settings::load() {
+        Ok(s) => (s, false),
+        Err(e) => {
+            log::error!(
+                "remove: settings unreadable ({e}); continuing with defaults — clearing must not depend on readable settings"
             );
-            println!("INFO: The block has not expired yet; leaving it in place.");
-            return 0;
+            (Settings::default(), true)
         }
-        RemovalDecision::NoBlock => {
-            // A task left over from a block that was cleared some other way would
-            // otherwise keep firing every few minutes until its repetition window
-            // ends. It is safe to drop it: there is no block to protect.
-            log::info!("remove: --if-expired and no block is running; dropping stale auto-clear");
-            if let Err(e) = scheduler::cancel_clear() {
-                log::warn!("could not remove stale auto-clear task: {e}");
-            }
-            println!("INFO: No block is running.");
-            return 0;
-        }
-    }
+    };
 
     if let Err(e) = security::ensure_secure_dir(&paths::config_dir()) {
         eprintln!("ERROR: refusing to use the secured settings directory: {e}");
         log::error!("secured settings directory is not secure: {e}");
         return EX_CONFIG;
+    }
+
+    // The scheduled auto-clear fires on a repeating timer, at logon, and possibly
+    // again after a resume. Only an actually expired block may be lifted. If the
+    // settings file was unreadable we cannot know the end date, so the explicit
+    // elevated removal is allowed to clear the rules.
+    if !settings_unreadable {
+        match removal_decision(&settings, args.if_expired) {
+            RemovalDecision::Clear => {}
+            RemovalDecision::NotExpired => {
+                log::info!(
+                    "remove: --if-expired, block still runs until {:?}; nothing to do",
+                    settings.block_end_date
+                );
+                println!("INFO: The block has not expired yet; leaving it in place.");
+                return 0;
+            }
+            RemovalDecision::NoBlock => {
+                // Settings can be stale. Check the actual system state before
+                // declaring that there is nothing to clear.
+                let mut manager = BlockManager::new(
+                    settings.active_block_as_whitelist,
+                    settings.allow_local_networks,
+                    settings.evaluate_common_subdomains,
+                    settings.include_linked_domains,
+                );
+                if manager.block_is_active() {
+                    log::warn!("remove: settings claim no block, but rules are present; clearing");
+                    if !manager.clear_block(true) {
+                        eprintln!(
+                            "ERROR: Block could not be fully cleared. Retry or inspect the log."
+                        );
+                        return EX_SOFTWARE;
+                    }
+                    settings.remove_block_from_settings();
+                    if let Err(e) = settings.save() {
+                        eprintln!("WARNING: could not persist settings: {e}");
+                    }
+                }
+                // A task left over from a block that was cleared some other way
+                // would otherwise keep firing every few minutes until its
+                // repetition window ends. Only drop it once the rules are gone.
+                log::info!(
+                    "remove: --if-expired and no block is running; dropping stale auto-clear"
+                );
+                if let Err(e) = scheduler::cancel_clear() {
+                    log::warn!("could not remove stale auto-clear task: {e}");
+                }
+                println!("INFO: No block is running.");
+                return 0;
+            }
+        }
     }
 
     log::info!("remove: force-clearing block");
@@ -649,8 +724,15 @@ fn cmd_remove(args: RemoveArgs, _log_path: &std::path::Path) -> u8 {
         settings.include_linked_domains,
     );
     let cleared = manager.clear_block(true);
+    if !cleared {
+        // Keep both the state and the auto-clear task: the block is still visible
+        // and a later run can retry instead of pretending everything is fine.
+        eprintln!("ERROR: Block could not be fully cleared. Retry or inspect the log.");
+        log::error!("remove: clear_block failed; keeping block state and auto-clear task");
+        return EX_SOFTWARE;
+    }
 
-    // Drop our own auto-clear task if we were invoked by it (or by the user).
+    // Drop our own auto-clear task only after the rules are actually gone.
     if let Err(e) = scheduler::cancel_clear() {
         log::warn!("could not cancel auto-clear task: {e}");
     }
@@ -660,13 +742,8 @@ fn cmd_remove(args: RemoveArgs, _log_path: &std::path::Path) -> u8 {
         eprintln!("WARNING: could not persist settings: {e}");
     }
 
-    if cleared {
-        println!("INFO: Block cleared.");
-        0
-    } else {
-        eprintln!("ERROR: Block could not be fully cleared. This may result in a permanent block.");
-        EX_SOFTWARE
-    }
+    println!("INFO: Block cleared.");
+    0
 }
 
 fn fail(context: &str, err: impl std::fmt::Display) -> u8 {

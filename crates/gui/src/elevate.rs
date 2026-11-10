@@ -135,4 +135,12 @@ mod tests {
     fn escapes_embedded_quote() {
         assert_eq!(windows_quote("a\"b"), "\"a\\\"b\"");
     }
+
+    #[test]
+    fn preserves_cyrillic_paths() {
+        assert_eq!(
+            windows_quote(r"C:\Users\Александр\Загрузки\SelfLock.exe"),
+            "\"C:\\Users\\Александр\\Загрузки\\SelfLock.exe\""
+        );
+    }
 }

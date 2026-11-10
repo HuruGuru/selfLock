@@ -2028,7 +2028,7 @@ checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
 name = "selflock-cli"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "chrono",
  "clap",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "selflock-core"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "chrono",
  "dns-lookup",
@@ -2055,7 +2055,7 @@ dependencies = [
 
 [[package]]
 name = "selflock-gui"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "chrono",
  "eframe",

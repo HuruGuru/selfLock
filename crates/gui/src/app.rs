@@ -240,6 +240,13 @@ impl App {
             );
             return;
         }
+        if self.prefs.is_allowlist && !cfg!(debug_assertions) {
+            self.set_status(
+                "Allowlist blocks are not supported in release builds.",
+                true,
+            );
+            return;
+        }
         let max = self.settings.max_block_minutes();
         if self.prefs.duration_minutes > max {
             self.prefs.duration_minutes = max;
@@ -279,10 +286,10 @@ impl App {
     }
 
     fn start_direct(&mut self, entries: &[String], end: DateTime<Utc>) {
+        let baseline = self.settings.clone();
         self.apply_prefs_to_settings();
-        self.settings
-            .begin_block(entries.to_vec(), self.prefs.is_allowlist, end);
-        let settings = self.settings.clone();
+        let mut desired = self.settings.clone();
+        desired.begin_block(entries.to_vec(), self.prefs.is_allowlist, end);
 
         let entries = entries.to_vec();
         let allowlist = self.prefs.is_allowlist;
@@ -294,18 +301,42 @@ impl App {
 
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
+            // Keep the UI thread responsive even if another process holds the
+            // settings lock or the ACL operation is slow.
+            if let Err(e) = selflock_core::security::ensure_secure_dir(&paths::config_dir()) {
+                let _ = tx.send(DirectOutcome::StartFailed(format!(
+                    "could not secure the state directory: {e}"
+                )));
+                return;
+            }
+
+            // Persist the state before applying rules: if the process dies during
+            // the firewall/hosts work, the block is still tracked and can be
+            // cleared. The check-and-set runs under the settings lock so a
+            // concurrent start loses.
+            if let Err(e) = Settings::update(|current| {
+                if current.block_is_running {
+                    return Err(selflock_core::Error::other("block is already running"));
+                }
+                current.merge_block_start(&baseline, &desired);
+                Ok(())
+            }) {
+                let _ = tx.send(DirectOutcome::StartFailed(format!(
+                    "could not persist block state: {e}"
+                )));
+                return;
+            }
+
             let mut manager = BlockManager::new(allowlist, allow_local, common, linked);
             let outcome = match manager.start_block_from_strings(&entries) {
                 Ok(()) => {
-                    if let Err(e) = settings.save() {
-                        log::warn!("could not persist settings after start: {e}");
-                    }
                     match exe {
                         Some(exe) => {
                             let args = vec![
                                 "--cli".to_string(),
                                 "remove".to_string(),
                                 "--force".to_string(),
+                                "--if-expired".to_string(),
                                 "--log-file".to_string(),
                                 log_path.display().to_string(),
                             ];
@@ -325,6 +356,26 @@ impl App {
                 }
                 Err(e) => {
                     log::error!("gui: start failed: {e}");
+                    if manager.block_is_active() {
+                        log::error!(
+                            "gui: start failed but rules are still active; keeping block state"
+                        );
+                    } else {
+                        // Only roll back the block we started; a concurrent clear
+                        // or new start must not be clobbered.
+                        if let Err(save_err) = Settings::update(|current| {
+                            if current.block_is_running
+                                && current.block_end_date == desired.block_end_date
+                            {
+                                current.remove_block_from_settings();
+                            }
+                            Ok(())
+                        }) {
+                            log::error!(
+                                "could not roll back settings after failed start: {save_err}"
+                            );
+                        }
+                    }
                     if e.is_permission_denied() {
                         DirectOutcome::StartDenied
                     } else {
@@ -404,10 +455,16 @@ impl App {
             std::thread::spawn(move || {
                 let mut manager = BlockManager::new(allowlist, allow_local, common, linked);
                 let ok = manager.clear_block(false);
-                let _ = scheduler::cancel_clear();
-                settings.remove_block_from_settings();
-                if let Err(e) = settings.save() {
-                    log::warn!("could not persist settings after clear: {e}");
+                if ok {
+                    // Only drop the state and the auto-clear task when the rules
+                    // are actually gone; otherwise a later run must retry.
+                    let _ = scheduler::cancel_clear();
+                    settings.remove_block_from_settings();
+                    if let Err(e) = settings.save() {
+                        log::warn!("could not persist settings after clear: {e}");
+                    }
+                } else {
+                    log::warn!("clear failed; keeping block state and auto-clear task");
                 }
                 let _ = tx.send(DirectOutcome::Cleared(ok));
             });
@@ -476,7 +533,7 @@ impl App {
             let allow_local = self.settings.allow_local_networks;
             let common = self.settings.evaluate_common_subdomains;
             let linked = self.settings.include_linked_domains;
-            let mut settings = self.settings.clone();
+            let settings = self.settings.clone();
             let to_add = entries;
             let (tx, rx) = mpsc::channel();
             std::thread::spawn(move || {
@@ -484,8 +541,17 @@ impl App {
                 manager.seed_blocked(&settings.active_blocklist);
                 let outcome = match manager.append_block_from_strings(&to_add) {
                     Ok(_) => {
-                        settings.active_blocklist.extend(to_add.iter().cloned());
-                        if let Err(e) = settings.save() {
+                        // Re-read under the lock so a concurrent add/clear is not
+                        // clobbered by this older snapshot.
+                        if let Err(e) = Settings::update(|current| {
+                            if !current.block_is_running {
+                                return Err(selflock_core::Error::other(
+                                    "block is no longer running; not persisting the added entries",
+                                ));
+                            }
+                            current.active_blocklist.extend(to_add.iter().cloned());
+                            Ok(())
+                        }) {
                             log::warn!("could not persist settings after add: {e}");
                         }
                         DirectOutcome::Added {
@@ -677,9 +743,19 @@ impl App {
                 match action {
                     BlockAction::Start => {
                         if self.settings.block_is_running {
-                            self.set_status("Block started.", false);
-                            if self.prefs.clear_caches {
-                                self.spawn_cache_clear();
+                            if code == 0 {
+                                self.set_status("Block started.", false);
+                                if self.prefs.clear_caches {
+                                    self.spawn_cache_clear();
+                                }
+                            } else {
+                                self.set_status(
+                                    format!(
+                                        "The elevated process exited (code {code}), but block rules are active. Clear the block or inspect the log."
+                                    ),
+                                    true,
+                                );
+                                self.show_log = true;
                             }
                         } else {
                             // The elevated helper cannot show a console, so the real
@@ -788,7 +864,7 @@ impl App {
                 }
             }
             (BlockAction::Start, DirectOutcome::StartDenied) => {
-                self.settings.remove_block_from_settings();
+                self.reload_settings();
                 self.set_status(
                     "Permission denied — run SelfLock as administrator to start a block.",
                     true,
@@ -796,7 +872,7 @@ impl App {
                 self.show_log = true;
             }
             (BlockAction::Start, DirectOutcome::StartFailed(e)) => {
-                self.settings.remove_block_from_settings();
+                self.reload_settings();
                 self.set_status(format!("Could not start block: {e}."), true);
                 self.show_log = true;
             }

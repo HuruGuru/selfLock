@@ -1,7 +1,7 @@
 //! Port of `HostFileBlocker` — manages the self-controlled region of the system
 //! hosts file between `# BEGIN SELFLOCK BLOCK` / `# END SELFLOCK BLOCK`.
 
-use crate::error::Result;
+use crate::error::{Error, Result};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -79,7 +79,17 @@ impl HostsContents {
         // land *before* it: `remove_block` deletes the header..footer range, so
         // anything appended after the footer would survive the clear as an orphan
         // entry. During a fresh start there is no footer yet, so this appends.
-        let insert_at = self.text.find(SELF_LOCK_FOOTER).unwrap_or(self.text.len());
+        //
+        // The footer must be searched only *after* our header. A stray footer above
+        // the block (left by another tool or an older damaged file) must not become
+        // the insertion point: the rule would be placed outside the block and would
+        // survive every clear.
+        let insert_at = match self.text.find(SELF_LOCK_HEADER) {
+            Some(header) => self.text[header..]
+                .find(SELF_LOCK_FOOTER)
+                .map_or(self.text.len(), |offset| header + offset),
+            None => self.text.len(),
+        };
         let mut rules = String::new();
         for rule in Self::rule_strings_to_block_domain(domain) {
             rules.push_str(&rule);
@@ -159,18 +169,30 @@ fn find_subslice(haystack: &[char], needle: &[char]) -> Option<usize> {
 pub struct HostFileBlocker {
     path: PathBuf,
     contents: HostsContents,
+    /// Non-`NotFound` error from the last read. While set, the in-memory contents
+    /// are not a trustworthy view of the file and writing is refused.
+    load_error: Option<String>,
 }
 
 impl HostFileBlocker {
     /// Create a blocker for the given path, loading existing contents (falling back
-    /// to the platform default when the file is missing).
+    /// to the platform default only when the file is missing).
     pub fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
-        let text =
-            fs::read_to_string(&path).unwrap_or_else(|_| default_hosts_contents().to_string());
+        let (text, load_error) = match fs::read_to_string(&path) {
+            Ok(text) => (text, None),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                (default_hosts_contents().to_string(), None)
+            }
+            Err(e) => {
+                log::error!("hosts: cannot read {}: {e}", path.display());
+                (String::new(), Some(e.to_string()))
+            }
+        };
         HostFileBlocker {
             path,
             contents: HostsContents::from_string(text),
+            load_error,
         }
     }
 
@@ -213,12 +235,31 @@ impl HostFileBlocker {
     }
 
     pub fn revert_to_disk(&mut self) {
-        let text =
-            fs::read_to_string(&self.path).unwrap_or_else(|_| default_hosts_contents().to_string());
-        self.contents = HostsContents::from_string(text);
+        match fs::read_to_string(&self.path) {
+            Ok(text) => {
+                self.contents = HostsContents::from_string(text);
+                self.load_error = None;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.contents = HostsContents::from_string(default_hosts_contents());
+                self.load_error = None;
+            }
+            Err(e) => {
+                // Keep the previous in-memory contents: replacing them with the
+                // default would make the next write clobber the real hosts file.
+                log::error!("hosts: cannot re-read {}: {e}", self.path.display());
+                self.load_error = Some(e.to_string());
+            }
+        }
     }
 
     pub fn write_new_file_contents(&self) -> Result<()> {
+        if let Some(error) = &self.load_error {
+            return Err(Error::other(format!(
+                "hosts file is unreadable; refusing to overwrite {}: {error}",
+                self.path.display()
+            )));
+        }
         write_atomic(&self.path, self.contents.as_str().as_bytes())
     }
 
@@ -359,6 +400,43 @@ mod tests {
             s.contains("# END SELFLOCK BLOCK\n127.0.0.1"),
             "pre-existing footer lost: {s:?}"
         );
+    }
+
+    #[test]
+    fn add_rule_ignores_footer_before_header() {
+        // A stray footer above our block must not become the insertion point.
+        let base = "# END SELFLOCK BLOCK\n127.0.0.1\tlocalhost\n";
+        let mut c = HostsContents::from_string(base);
+        c.add_header();
+        c.add_rule_blocking_domain("evil.test");
+        c.add_footer();
+        c.remove_block();
+
+        assert!(
+            !c.as_str().contains("evil.test"),
+            "rule outside the block survived the clear: {:?}",
+            c.as_str()
+        );
+        assert!(c.as_str().contains("# END SELFLOCK BLOCK\n127.0.0.1"));
+    }
+
+    #[test]
+    fn unreadable_hosts_is_not_overwritten() {
+        let dir = std::env::temp_dir();
+        let path = dir.join(format!(
+            "sl-hosts-unreadable-{}-{}.txt",
+            std::process::id(),
+            rand_suffix()
+        ));
+        // Invalid UTF-8: read_to_string fails, but write_atomic would succeed.
+        let original = b"127.0.0.1\tlocalhost\n\xFF\xFE\n";
+        std::fs::write(&path, original).unwrap();
+
+        let blocker = HostFileBlocker::new(&path);
+        assert!(blocker.write_new_file_contents().is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

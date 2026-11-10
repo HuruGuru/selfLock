@@ -12,7 +12,7 @@ path = "src/main.rs"
 
 [dependencies]
 selflock-core = { workspace = true }
-selflock-cli = { path = "../cli", version = "1.4.0" }
+selflock-cli = { path = "../cli", version = "1.4.1" }
 eframe = { version = "0.29", default-features = false, features = ["default_fonts", "glow"] }
 egui = "0.29"
 chrono = "0.4"

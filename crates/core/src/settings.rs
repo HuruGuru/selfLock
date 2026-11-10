@@ -11,6 +11,7 @@ use crate::paths;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 fn default_block_duration() -> u32 {
     60
@@ -120,11 +121,38 @@ impl Settings {
 
     pub fn save_to(&self, path: impl AsRef<Path>) -> Result<()> {
         let path = path.as_ref();
+        // Wait for the cross-process lock instead of silently proceeding without it.
+        let _lock = FileLock::acquire(paths::settings_lock_file(), Duration::from_secs(10))?;
+        self.save_locked(path)
+    }
+
+    /// Read, mutate and write the settings while holding the cross-process lock.
+    ///
+    /// Use this instead of `load()` + `save()` for read-modify-write operations so
+    /// two processes cannot overwrite each other's updates.
+    pub fn update<F>(mutate: F) -> Result<Self>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        Self::update_at(Self::path(), mutate)
+    }
+
+    pub fn update_at<F>(path: impl AsRef<Path>, mutate: F) -> Result<Self>
+    where
+        F: FnOnce(&mut Self) -> Result<()>,
+    {
+        let path = path.as_ref();
+        let _lock = FileLock::acquire(paths::settings_lock_file(), Duration::from_secs(10))?;
+        let mut settings = Self::load_from(path)?;
+        mutate(&mut settings)?;
+        settings.save_locked(path)?;
+        Ok(settings)
+    }
+
+    fn save_locked(&self, path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        // Serialize access so two processes can't interleave a read-modify-write.
-        let _lock = FileLock::try_acquire(paths::settings_lock_file());
         let text = serde_json::to_string_pretty(self)
             .map_err(|e| crate::error::Error::other(e.to_string()))?;
         let result = crate::hosts::write_atomic(path, text.as_bytes());
@@ -197,6 +225,37 @@ impl Settings {
         self.active_block_as_whitelist = is_allowlist;
         self.block_end_date = Some(end_date);
         self.block_is_running = true;
+    }
+
+    /// Merge a block-start snapshot into the current on-disk settings.
+    ///
+    /// Block fields are always taken from `desired`. Other options are copied only
+    /// when they have not changed since `baseline`, so an option edited by another
+    /// process while this start was in flight is not overwritten with stale data.
+    pub fn merge_block_start(&mut self, baseline: &Self, desired: &Self) {
+        self.active_blocklist = desired.active_blocklist.clone();
+        self.active_block_as_whitelist = desired.active_block_as_whitelist;
+        self.block_end_date = desired.block_end_date;
+        self.block_is_running = desired.block_is_running;
+
+        if self.evaluate_common_subdomains == baseline.evaluate_common_subdomains {
+            self.evaluate_common_subdomains = desired.evaluate_common_subdomains;
+        }
+        if self.include_linked_domains == baseline.include_linked_domains {
+            self.include_linked_domains = desired.include_linked_domains;
+        }
+        if self.clear_caches == baseline.clear_caches {
+            self.clear_caches = desired.clear_caches;
+        }
+        if self.allow_local_networks == baseline.allow_local_networks {
+            self.allow_local_networks = desired.allow_local_networks;
+        }
+        if self.block_duration == baseline.block_duration {
+            self.block_duration = desired.block_duration;
+        }
+        if self.max_block_length == baseline.max_block_length {
+            self.max_block_length = desired.max_block_length;
+        }
     }
 }
 
@@ -276,6 +335,31 @@ mod tests {
             Utc::now() + Duration::minutes(10),
         );
         assert!(!s.block_is_expired_within(Duration::seconds(2)));
+    }
+
+    #[test]
+    fn merge_block_start_keeps_concurrent_option_changes() {
+        let baseline = Settings::default();
+        let mut desired = baseline.clone();
+        desired.begin_block(
+            vec!["example.com".into()],
+            false,
+            Utc::now() + Duration::minutes(10),
+        );
+        desired.evaluate_common_subdomains = false;
+
+        // Another process changed include_linked_domains after our baseline.
+        let mut current = baseline.clone();
+        current.include_linked_domains = false;
+
+        current.merge_block_start(&baseline, &desired);
+
+        assert_eq!(current.active_blocklist, vec!["example.com".to_string()]);
+        assert!(current.block_is_running);
+        // Our unchanged option is merged...
+        assert!(!current.evaluate_common_subdomains);
+        // ...but the concurrent change is not overwritten.
+        assert!(!current.include_linked_domains);
     }
 
     #[test]

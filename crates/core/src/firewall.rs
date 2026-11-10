@@ -132,7 +132,7 @@ pub(crate) fn run(program: &str, args: &[&str]) -> Result<(bool, String)> {
 pub mod netsh {
     use super::*;
     use crate::hosts::write_atomic;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
 
     pub const NETS: &str = "netsh";
 
@@ -144,15 +144,21 @@ pub mod netsh {
     /// File listing the exact rule names we created. Reading this is far cheaper
     /// (and safer) than enumerating every firewall rule via `show rule name=all`,
     /// which can hang when run as SYSTEM in session 0.
-    pub const STATE_PATH: &str = "C:\\ProgramData\\SelfLock\\firewall-rules.txt";
+    fn state_path() -> PathBuf {
+        crate::paths::config_dir().join("firewall-rules.txt")
+    }
 
     /// Records the per-profile outbound firewall policy we replaced when enabling an
     /// allowlist block, so we can restore the user's original policy on clear
     /// instead of assuming the Windows default.
-    pub const POLICY_PATH: &str = "C:\\ProgramData\\SelfLock\\firewall-policy.txt";
+    fn policy_path() -> PathBuf {
+        crate::paths::config_dir().join("firewall-policy.txt")
+    }
 
     /// Temporary `netsh -f` batch script used to apply all rules in a single process.
-    pub const SCRIPT_PATH: &str = "C:\\ProgramData\\SelfLock\\netsh-script.txt";
+    fn script_path() -> PathBuf {
+        crate::paths::config_dir().join("netsh-script.txt")
+    }
 
     pub struct NetshFirewall {
         rules: Vec<FirewallRule>,
@@ -224,13 +230,27 @@ pub mod netsh {
             args
         }
 
+        /// Whether `name` is exactly a rule name this program could have created.
+        ///
+        /// The state file lives in a directory that may be attacker-controlled before
+        /// the first elevation, so its contents are never passed to `netsh` without
+        /// validation. Generated names contain only ASCII alphanumerics and `-`.
+        pub(crate) fn is_our_rule_name(name: &str) -> bool {
+            name.strip_prefix(RULE_PREFIX).is_some_and(|suffix| {
+                !suffix.is_empty()
+                    && suffix
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+        }
+
         /// Rule names recorded in our state file, if any.
         fn state_rule_names() -> Vec<String> {
-            std::fs::read_to_string(STATE_PATH)
+            std::fs::read_to_string(state_path())
                 .map(|text| {
                     text.lines()
                         .map(|l| l.trim().to_string())
-                        .filter(|l| !l.is_empty())
+                        .filter(|l| Self::is_our_rule_name(l))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -254,8 +274,7 @@ pub mod netsh {
         /// `netsh -f` batch used for incremental additions. Unique per process so a
         /// concurrent auto-clear cannot overwrite it mid-run.
         fn append_script_path(tag: &str) -> PathBuf {
-            Path::new(SCRIPT_PATH)
-                .with_file_name(format!("netsh-append-{}-{tag}.txt", std::process::id()))
+            script_path().with_file_name(format!("netsh-append-{}-{tag}.txt", std::process::id()))
         }
 
         /// Build the `netsh -f` lines for `rules`, starting at `offset`, and the rule
@@ -292,10 +311,11 @@ pub mod netsh {
         }
 
         fn write_state(names: &[String]) -> Result<()> {
-            if let Some(parent) = Path::new(STATE_PATH).parent() {
+            let path = state_path();
+            if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
-            write_atomic(Path::new(STATE_PATH), names.join("\n").as_bytes())
+            write_atomic(&path, names.join("\n").as_bytes())
         }
 
         /// Scan all rules for our name prefix (fallback when there is no state file,
@@ -309,7 +329,7 @@ pub mod netsh {
                     .lines()
                     .filter_map(|line| line.trim_start().strip_prefix("Rule Name:"))
                     .map(|n| n.trim().to_string())
-                    .filter(|n| n.starts_with(RULE_PREFIX))
+                    .filter(|n| Self::is_our_rule_name(n))
                     .collect(),
                 _ => Vec::new(),
             }
@@ -370,7 +390,8 @@ pub mod netsh {
                 );
                 return Ok(());
             }
-            if let Some(parent) = Path::new(POLICY_PATH).parent() {
+            let path = policy_path();
+            if let Some(parent) = path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             let text = policies
@@ -379,12 +400,13 @@ pub mod netsh {
                 .collect::<Vec<_>>()
                 .join("\n");
             log::info!("netsh: saved prior firewall policy: {text}");
-            write_atomic(Path::new(POLICY_PATH), text.as_bytes())
+            write_atomic(&path, text.as_bytes())
         }
 
         /// Restore the outbound policy recorded by [`save_policies`], if any.
         fn restore_policies() {
-            let Ok(text) = std::fs::read_to_string(POLICY_PATH) else {
+            let path = policy_path();
+            let Ok(text) = std::fs::read_to_string(&path) else {
                 return;
             };
             for line in text.lines() {
@@ -399,7 +421,7 @@ pub mod netsh {
                 log::info!("netsh: restoring firewall policy {key} -> {value}");
                 let _ = run(NETS, &["advfirewall", "set", key, "firewallpolicy", value]);
             }
-            let _ = std::fs::remove_file(POLICY_PATH);
+            let _ = std::fs::remove_file(&path);
         }
     }
 
@@ -416,7 +438,9 @@ pub mod netsh {
             log::info!("netsh: start_block (allowlist={allowlist})");
             self.allowlist = allowlist;
             // Clean any previous rules first (also restores a previously saved policy).
-            let _ = self.stop_block(true);
+            // A failed cleanup must abort the new block: continuing could leave old
+            // rules mixed with the new ones.
+            self.stop_block(true)?;
 
             // Build every command up front as a `netsh -f` batch script. Applying
             // thousands of rules one process per rule takes minutes and makes the
@@ -479,11 +503,12 @@ pub mod netsh {
             // still be cleaned up by name.
             Self::write_state(&created)?;
 
-            if let Some(parent) = Path::new(SCRIPT_PATH).parent() {
+            let script = script_path();
+            if let Some(parent) = script.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             let script_text = commands.join("\r\n");
-            write_atomic(Path::new(SCRIPT_PATH), script_text.as_bytes())?;
+            write_atomic(&script, script_text.as_bytes())?;
 
             if commands.len() <= 100 {
                 log::debug!(
@@ -508,17 +533,18 @@ pub mod netsh {
                 "netsh: applying {} command(s) (allowlist={allowlist}) in one batch",
                 commands.len()
             );
-            let result = run_checked(NETS, &["-f", SCRIPT_PATH]);
+            let script_arg = script.display().to_string();
+            let result = run_checked(NETS, &["-f", &script_arg]);
             match &result {
                 Ok(_) => {
-                    let _ = std::fs::remove_file(SCRIPT_PATH);
+                    let _ = std::fs::remove_file(&script);
                 }
                 Err(_) => {
                     // Keep the exact batch that failed; it is the fastest way to see
                     // which generated line netsh rejected.
                     log::error!(
                         "netsh: batch failed; keeping it for diagnosis at {}",
-                        SCRIPT_PATH
+                        script.display()
                     );
                 }
             }
@@ -564,6 +590,9 @@ pub mod netsh {
             Self::write_state(&new_state)?;
 
             let script_path = Self::append_script_path("add");
+            if let Some(parent) = script_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             let script_text = commands.join("\r\n");
             write_atomic(&script_path, script_text.as_bytes())?;
             log::debug!(
@@ -621,25 +650,48 @@ pub mod netsh {
 
         fn stop_block(&self, _force: bool) -> Result<()> {
             let names = Self::existing_rule_names();
-            if !names.is_empty() {
-                log::info!("netsh: removing {} SelfLock rule(s)", names.len());
+            if names.is_empty() {
+                // No rules to delete: it is safe to restore the policy and drop a
+                // stale/empty state file.
+                Self::restore_policies();
+                let _ = std::fs::remove_file(state_path());
+                return Ok(());
             }
-            if !names.is_empty() {
-                let mut commands: Vec<String> = Vec::new();
-                for name in &names {
-                    commands.push(format!("advfirewall firewall delete rule name={name}"));
-                }
-                if let Some(parent) = Path::new(SCRIPT_PATH).parent() {
-                    std::fs::create_dir_all(parent)?;
-                }
-                if write_atomic(Path::new(SCRIPT_PATH), commands.join("\r\n").as_bytes()).is_ok() {
-                    let _ = run(NETS, &["-f", SCRIPT_PATH]);
-                    let _ = std::fs::remove_file(SCRIPT_PATH);
-                }
+
+            log::info!("netsh: removing {} SelfLock rule(s)", names.len());
+            let mut commands: Vec<String> = Vec::new();
+            for name in &names {
+                commands.push(format!("advfirewall firewall delete rule name={name}"));
             }
-            // Restore the user's original outbound policy (only if we changed it).
+
+            let script = script_path();
+            if let Some(parent) = script.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            write_atomic(&script, commands.join("\r\n").as_bytes())?;
+
+            let script_arg = script.display().to_string();
+            let (success, output) = run(NETS, &["-f", &script_arg])?;
+            if !success {
+                // Keep the state file: it is the only reliable list of rules that
+                // still need removing. Do not restore the old firewall policy while
+                // rules may still be active.
+                log::error!(
+                    "netsh: deleting rules failed; keeping state at {}: {}",
+                    state_path().display(),
+                    brief(&output)
+                );
+                return Err(Error::Command {
+                    command: format!("netsh -f {}", script.display()),
+                    message: output.trim().to_string(),
+                });
+            }
+
+            let _ = std::fs::remove_file(&script);
+            let _ = std::fs::remove_file(state_path());
+            // Restore the user's original outbound policy only after the rules are
+            // actually gone.
             Self::restore_policies();
-            let _ = std::fs::remove_file(STATE_PATH);
             Ok(())
         }
     }
@@ -654,6 +706,27 @@ mod tests {
         let r = FirewallRule::new(Some("1.2.3.4".into()), 0, 0);
         assert_eq!(r.port, None);
         assert_eq!(r.mask_len, None);
+    }
+
+    #[test]
+    fn validates_rule_names_from_state() {
+        for name in [
+            "SelfLock-0",
+            "SelfLock-12-app",
+            "SelfLock-3-tcp",
+            "SelfLock-svc-udp-5353",
+        ] {
+            assert!(netsh::NetshFirewall::is_our_rule_name(name), "{name}");
+        }
+        for name in [
+            "Other-0",
+            "SelfLock-",
+            "SelfLock-0 dir=in",
+            "SelfLock-0\r\nadvfirewall set allprofiles firewallpolicy allowinbound,allowoutbound",
+            "SelfLock-0;calc",
+        ] {
+            assert!(!netsh::NetshFirewall::is_our_rule_name(name), "{name:?}");
+        }
     }
 
     #[test]
